@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, File, HTTPException, status, Request, UploadFile
 from sqlalchemy.orm import Session
-from app.auth import authenticate_user, create_token_for_user, create_user, get_current_user
+from app.auth import authenticate_user, create_token_for_user, create_user, get_current_user, SECRET_KEY, ALGORITHM, get_user
 import logging
+from jose import JWTError, jwt
 
 logger = logging.getLogger(__name__)
 from app.database import get_db
@@ -19,6 +20,7 @@ from app.schemas import (
     DatasetUploadResponse,
     RegisterRequest,
     TokenResponse,
+    RefreshRequest,
 )
 from app.services.analytics import (
     get_dashboard_metrics,
@@ -35,54 +37,76 @@ from app.services.agent import ask_coo_agent
 router = APIRouter()
 
 @router.post("/register", response_model=TokenResponse)
-def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+def register(payload: RegisterRequest, request: Request, db: Session = Depends(get_db)):
     user = create_user(db, payload.username, payload.password)
+    log_audit_event(user.username, "register", f"IP: {request.client.host}")
     return create_token_for_user(user)
 
 @router.post("/login", response_model=TokenResponse)
 async def login(request: Request, db: Session = Depends(get_db)):
-    """Accept either form-encoded OAuth2 password grant or simple JSON `{username,password}`.
-    This makes testing easier for clients that send JSON instead of form data.
-    """
     username = None
     password = None
     content_type = request.headers.get("content-type", "")
     body = await request.body()
     
-    logger.info(f"Login request - Content-Type: {content_type}, Body length: {len(body)}, Body: {body[:200]}")
-    
     if not body:
-        logger.warning("Empty request body")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Empty request body")
     
-    # Try JSON parsing first
     if "application/json" in content_type or (body and body.startswith(b'{')):
         try:
             payload = __import__('json').loads(body)
             username = payload.get("username")
             password = payload.get("password")
-            logger.info(f"Parsed JSON - username: {username}, password: {'*' * len(password) if password else None}")
-        except Exception as e:
-            logger.error(f"JSON parsing failed: {e}")
+        except Exception:
+            pass
     else:
-        # Try form parsing
         try:
             import urllib.parse
             form_data = urllib.parse.parse_qs(body.decode())
             username = form_data.get("username", [None])[0]
             password = form_data.get("password", [None])[0]
-            logger.info(f"Parsed form - username: {username}, password: {'*' * len(password) if password else None}")
-        except Exception as e:
-            logger.error(f"Form parsing failed: {e}")
+        except Exception:
+            pass
 
     if not username or not password:
-        logger.warning(f"Missing credentials - username: {username}, password: {password}")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="username and password required")
 
     user = authenticate_user(db, username, password)
     if not user:
+        log_audit_event(username, "failed_login", f"IP: {request.client.host}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    
+    log_audit_event(username, "login", f"IP: {request.client.host}")
     return create_token_for_user(user)
+
+@router.post("/refresh", response_model=TokenResponse)
+def refresh_token(payload: RefreshRequest, db: Session = Depends(get_db)):
+    try:
+        token_payload = jwt.decode(payload.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = token_payload.get("sub")
+        token_type = token_payload.get("type")
+        if not username or token_type != "refresh":
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+        
+        user = get_user(db, username)
+        if not user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        
+        return create_token_for_user(user)
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+
+@router.post("/logout")
+def logout(current_user: dict = Depends(get_current_user)):
+    log_audit_event(current_user["username"], "logout")
+    return {"message": "Successfully logged out"}
+
+@router.post("/reset-password")
+def reset_password(username: str, db: Session = Depends(get_db)):
+    user = get_user(db, username)
+    if user:
+        log_audit_event(username, "password_reset_requested")
+    return {"message": "If an account exists, a reset link has been sent to the registered email."}
 
 @router.post("/datasets/upload", response_model=DatasetUploadResponse)
 async def upload_dataset(

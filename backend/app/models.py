@@ -24,6 +24,8 @@ class AuthUser(Base):
     username = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     role = Column(String, nullable=False, default="user")
+    failed_login_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime, nullable=True)
 
 class UploadedDataset(Base):
     __tablename__ = "uploaded_datasets"

@@ -1,3 +1,6 @@
+import os
+import re
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
@@ -10,9 +13,14 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import AuthUser
 
-SECRET_KEY = "REPLACE_WITH_SECURE_RANDOM_KEY"
+# Use env variable or generate a secure fallback
+SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_urlsafe(32))
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
+REFRESH_TOKEN_EXPIRE_DAYS = 7
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
+
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
@@ -37,12 +45,26 @@ def get_user(db: Session, username: str) -> Optional[AuthUser]:
     return db.query(AuthUser).filter(AuthUser.username == username).first()
 
 
+def validate_password_complexity(password: str):
+    if len(password) < 8:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must be at least 8 characters")
+    if not re.search(r"[A-Z]", password):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must contain at least one uppercase letter")
+    if not re.search(r"[a-z]", password):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must contain at least one lowercase letter")
+    if not re.search(r"[0-9]", password):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must contain at least one number")
+    if not re.search(r"[\W_]", password):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must contain at least one special character")
+
+
 def create_user(db: Session, username: str, password: str) -> AuthUser:
     cleaned_username = username.strip()
     if len(cleaned_username) < 3:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username must be at least 3 characters")
-    if len(password) < 8:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must be at least 8 characters")
+    
+    validate_password_complexity(password)
+
     if get_user(db, cleaned_username):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username is already taken")
 
@@ -55,21 +77,48 @@ def create_user(db: Session, username: str, password: str) -> AuthUser:
 
 def authenticate_user(db: Session, username: str, password: str) -> Optional[AuthUser]:
     user = get_user(db, username)
-    if not user or not verify_password(password, user.hashed_password):
+    if not user:
         return None
+
+    # Check lockout
+    if user.locked_until and user.locked_until > datetime.utcnow():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account locked. Try again later.")
+
+    # Reset lockout if time passed
+    if user.locked_until and user.locked_until <= datetime.utcnow():
+        user.locked_until = None
+        user.failed_login_attempts = 0
+        db.commit()
+
+    if not verify_password(password, user.hashed_password):
+        user.failed_login_attempts += 1
+        if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
+            user.locked_until = datetime.utcnow() + timedelta(minutes=LOCKOUT_MINUTES)
+        db.commit()
+        return None
+
+    # Success: reset attempts
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    db.commit()
     return user
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+def create_token(data: dict, expires_delta: timedelta) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    expire = datetime.utcnow() + expires_delta
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def create_token_for_user(user: AuthUser) -> Dict[str, str]:
-    token = create_access_token({"sub": user.username, "role": user.role})
-    return {"access_token": token, "token_type": "bearer"}
+    access_token = create_token({"sub": user.username, "role": user.role, "type": "access"}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    refresh_token = create_token({"sub": user.username, "type": "refresh"}, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
 
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> Dict[str, Any]:
@@ -81,7 +130,8 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
-        if username is None:
+        token_type: str = payload.get("type")
+        if username is None or token_type != "access":
             raise credentials_exception
     except JWTError:
         raise credentials_exception
